@@ -10,6 +10,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 import httpx
 import json
+import shap
 
 load_dotenv()
 
@@ -17,7 +18,7 @@ app = FastAPI(title="DriverIQ API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=["*"], # Updated to allow all origins for dev flexibility
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -36,6 +37,13 @@ risk_encoder = joblib.load(BASE / "models/risk_label_encoder.pkl")
 ward_clusters = pd.read_csv(BASE / "models/ward_cluster_labels.csv")
 df = df.merge(ward_clusters[["ward", "cluster_label"]], on="ward", how="left")
 
+# Initialize SHAP explainers
+risk_features = ["driver_cancellation_rate", "driver_quote_acceptance_rate", "conversion_rate", "booking_cancellation_rate", "user_cancellation_rate", "earnings_per_km", "avg_distance", "avg_fare", "supply_gap", "reliability_score"]
+acceptance_features = ["earnings_per_km", "avg_distance", "avg_fare", "supply_gap"]
+
+risk_explainer = shap.Explainer(risk_clf, df[risk_features])
+acceptance_explainer = shap.Explainer(acceptance_reg, df[acceptance_features])
+
 CITY_AVG = df.drop(columns=["ward", "cluster_label"], errors="ignore").mean().to_dict()
 
 CLUSTER_DESCRIPTIONS = {
@@ -43,6 +51,24 @@ CLUSTER_DESCRIPTIONS = {
     "⚠️ High-Risk Zones":     "Low acceptance and high cancellations. Needs urgent fare floor or supply push.",
     "🔄 Average Balanced":    "Moderate performers. Monitor and improve incentive structure.",
 }
+
+# ── Models ──────────────────────────────────────────────────────
+class PredictRiskRequest(BaseModel):
+    driver_cancellation_rate: float
+    driver_quote_acceptance_rate: float
+    conversion_rate: float
+
+class PredictAcceptanceRequest(BaseModel):
+    earnings_per_km: float
+    avg_distance: float
+    avg_fare: float
+    supply_gap: float
+
+class PredictClusterRequest(BaseModel):
+    driver_cancellation_rate: float
+    driver_quote_acceptance_rate: float
+    earnings_per_km: float
+    avg_distance: float
 
 # ── Helpers ─────────────────────────────────────────────────────
 def get_ward_row(ward_name: str) -> pd.Series:
@@ -61,18 +87,7 @@ def predict_acceptance(earnings_per_km, avg_distance, avg_fare, supply_gap) -> f
     return float(np.clip(acceptance_reg.predict(X)[0], 0, 1))
 
 def predict_risk(row: pd.Series) -> str:
-    X = pd.DataFrame([{
-        "driver_cancellation_rate":    row["driver_cancellation_rate"],
-        "driver_quote_acceptance_rate": row["driver_quote_acceptance_rate"],
-        "conversion_rate":             row["conversion_rate"],
-        "booking_cancellation_rate":   row["booking_cancellation_rate"],
-        "user_cancellation_rate":      row["user_cancellation_rate"],
-        "earnings_per_km":             row["earnings_per_km"],
-        "avg_distance":                row["avg_distance"],
-        "avg_fare":                    row["avg_fare"],
-        "supply_gap":                  row["supply_gap"],
-        "reliability_score":           row["reliability_score"],
-    }])
+    X = pd.DataFrame([{f: row[f] for f in risk_features}])
     label_idx = risk_clf.predict(X)[0]
     return risk_encoder.inverse_transform([label_idx])[0] if hasattr(risk_encoder, "inverse_transform") else str(label_idx)
 
@@ -93,6 +108,126 @@ def recommend_actions(row: pd.Series) -> list[str]:
     return actions
 
 # ── Routes ───────────────────────────────────────────────────────
+
+@app.get("/overview")
+def get_overview():
+    tmp = df.copy()
+    tmp["risk"] = tmp.apply(predict_risk, axis=1)
+    
+    risk_counts = tmp["risk"].value_counts().to_dict()
+    
+    top_leakage = tmp.nlargest(10, "revenue_leakage")[["ward", "revenue_leakage", "risk"]].to_dict(orient="records")
+    
+    leakage_by_cluster = tmp.groupby("cluster_label").agg(
+        avg_leakage=("revenue_leakage", "mean"),
+        count=("ward", "count")
+    ).reset_index().rename(columns={"cluster_label": "cluster"}).to_dict(orient="records")
+    
+    return {
+        "total_wards": len(df),
+        "high_risk_count": risk_counts.get("High", 0),
+        "medium_risk_count": risk_counts.get("Medium", 0),
+        "low_risk_count": risk_counts.get("Low", 0),
+        "city_avg_acceptance": CITY_AVG["driver_quote_acceptance_rate"],
+        "city_avg_cancellation": CITY_AVG["driver_cancellation_rate"],
+        "city_avg_conversion": CITY_AVG["conversion_rate"],
+        "city_avg_earnings_per_km": CITY_AVG["earnings_per_km"],
+        "total_revenue_leakage": df["revenue_leakage"].sum(),
+        "top_leakage_wards": top_leakage,
+        "acceptance_vs_earnings": tmp[["ward", "driver_quote_acceptance_rate", "earnings_per_km", "revenue_leakage", "risk"]].to_dict(orient="records"),
+        "cancellation_vs_conversion": tmp[["ward", "driver_cancellation_rate", "conversion_rate", "risk"]].to_dict(orient="records"),
+        "leakage_by_cluster": leakage_by_cluster
+    }
+
+@app.get("/ward/{ward_name}/trends")
+def get_ward_trends(ward_name: str):
+    row = get_ward_row(ward_name)
+    
+    # Calculate percentiles
+    metrics = {
+        "acceptance": "driver_quote_acceptance_rate",
+        "cancellation": "driver_cancellation_rate",
+        "conversion": "conversion_rate",
+        "earnings": "earnings_per_km",
+        "leakage": "revenue_leakage"
+    }
+    
+    percentiles = {}
+    for key, col in metrics.items():
+        percentiles[f"{key}_percentile"] = float((df[col] <= row[col]).mean() * 100)
+    
+    cluster_peers = df[df["cluster_label"] == row["cluster_label"]][["ward", "driver_quote_acceptance_rate", "earnings_per_km"]].to_dict(orient="records")
+    
+    return {**percentiles, "cluster_peers": cluster_peers}
+
+@app.post("/predict/risk")
+def route_predict_risk(body: PredictRiskRequest):
+    # For prediction, we use city averages for missing features
+    input_data = {f: CITY_AVG.get(f, 0) for f in risk_features}
+    input_data.update(body.model_dump())
+    
+    X = pd.DataFrame([input_data])
+    label_idx = risk_clf.predict(X)[0]
+    risk = risk_encoder.inverse_transform([label_idx])[0] if hasattr(risk_encoder, "inverse_transform") else str(label_idx)
+    
+    probs = risk_clf.predict_proba(X)[0]
+    prob_dict = {risk_encoder.inverse_transform([i])[0]: float(probs[i]) for i in range(len(probs))}
+    
+    return {"risk": risk, "probabilities": prob_dict}
+
+@app.post("/predict/acceptance")
+def route_predict_acceptance(body: PredictAcceptanceRequest):
+    pred = predict_acceptance(body.earnings_per_km, body.avg_distance, body.avg_fare, body.supply_gap)
+    avg_acc = CITY_AVG["driver_quote_acceptance_rate"]
+    interpretation = f"{'High' if pred > avg_acc else 'Low'} — {'above' if pred > avg_acc else 'below'} city avg of {avg_acc:.1%}"
+    
+    return {"predicted_acceptance": pred, "interpretation": interpretation}
+
+@app.post("/predict/cluster")
+def route_predict_cluster(body: PredictClusterRequest):
+    # Cluster features are defined in cluster_scaler/kmeans. 
+    # Usually: driver_cancellation_rate, driver_quote_acceptance_rate, earnings_per_km, avg_distance
+    X_raw = pd.DataFrame([body.model_dump()])
+    X_scaled = cluster_scaler.transform(X_raw)
+    cluster_idx = kmeans.predict(X_scaled)[0]
+    
+    # Map cluster index to label
+    cluster_label = cluster_label_map.get(cluster_idx, f"Cluster {cluster_idx}")
+    description = CLUSTER_DESCRIPTIONS.get(cluster_label, "Driver behavior segment.")
+    
+    similar_wards = df[df["cluster_label"] == cluster_label]["ward"].head(5).tolist()
+    
+    return {"cluster_label": cluster_label, "description": description, "similar_wards": similar_wards}
+
+@app.get("/predict/shap/{ward_name}")
+def get_shap_values(ward_name: str):
+    row = get_ward_row(ward_name)
+    
+    # Risk SHAP
+    X_risk = pd.DataFrame([{f: row[f] for f in risk_features}])
+    shap_risk = risk_explainer(X_risk)
+    label_idx = risk_clf.predict(X_risk)[0]
+    
+    risk_shap_list = []
+    for i, f in enumerate(risk_features):
+        val = shap_risk.values[0][i]
+        impact = float(val[label_idx]) if isinstance(val, (list, np.ndarray)) else float(val)
+        risk_shap_list.append({"feature": f, "value": float(X_risk[f].iloc[0]), "impact": impact})
+    
+    # Acceptance SHAP
+    X_acc = pd.DataFrame([{f: row[f] for f in acceptance_features}])
+    shap_acc = acceptance_explainer(X_acc)
+    
+    acc_shap_list = []
+    for i, f in enumerate(acceptance_features):
+        val = shap_acc.values[0][i]
+        impact = float(val[0]) if isinstance(val, (list, np.ndarray)) else float(val)
+        acc_shap_list.append({"feature": f, "value": float(X_acc[f].iloc[0]), "impact": impact})
+    
+    return {
+        "risk_shap": sorted(risk_shap_list, key=lambda x: abs(x["impact"]), reverse=True),
+        "acceptance_shap": sorted(acc_shap_list, key=lambda x: abs(x["impact"]), reverse=True)
+    }
 
 @app.get("/wards")
 def list_wards():
@@ -193,7 +328,7 @@ In 3-4 sentences, explain what is happening in this ward and why, in plain busin
                     "Content-Type": "application/json",
                 },
                 json={
-                    "model": "qwen/qwen3-coder:free",
+                    "model": "google/gemini-2.0-flash-lite-preview-02-05:free",
                     "max_tokens": 300,
                     "stream": True,
                     "messages": [
